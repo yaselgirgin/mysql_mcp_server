@@ -7,6 +7,7 @@ import socket
 import time
 import subprocess
 import traceback
+import sqlparse
 from contextlib import contextmanager, asynccontextmanager
 from typing import List, Optional, Tuple, Any
 
@@ -298,8 +299,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="execute_sql",
             description=(
-                "Execute a SQL statement against the MySQL server. "
-                "Use for SELECT, DML (INSERT/UPDATE/DELETE), SHOW, DESCRIBE, and ad-hoc queries. "
+                "Execute a read-only SQL query against the MySQL server. "
+                "Only SELECT, SHOW, DESCRIBE/DESC, EXPLAIN, and read-only CTE SELECT queries are allowed. "
                 "Supports cross-database queries using database.table notation. "
                 "Single statements only — use fully qualified names instead of USE statements."
             ),
@@ -314,9 +315,9 @@ async def list_tools() -> list[Tool]:
                 "required": ["query"]
             },
             annotations=ToolAnnotations(
-                title="Execute SQL",
-                readOnlyHint=False,
-                destructiveHint=True
+                title="Execute Read-Only SQL",
+                readOnlyHint=True,
+                destructiveHint=False
             )
         ),
         Tool(
@@ -384,11 +385,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             query = arguments.get("query")
             if not query:
                 raise ValueError("Query is required")
-            if ";" in query.strip().rstrip(";"):
+
+            parsed = [stmt for stmt in sqlparse.parse(query) if str(stmt).strip()]
+            if len(parsed) != 1 or ";" in query.strip().rstrip(";"):
                 return [TextContent(type="text", text=(
-                    "Only single statements are supported. "
-                    "Instead of USE statements, use fully qualified names: database.table"
+                    "Only a single read-only SQL statement is supported. "
+                    "Use fully qualified names instead of USE statements."
                 ))]
+
+            statement_type = parsed[0].get_type().upper()
+            query_upper = query.lstrip().upper()
+            allowed_prefixes = ("SHOW ", "DESCRIBE ", "DESC ", "EXPLAIN ")
+            if statement_type != "SELECT" and not query_upper.startswith(allowed_prefixes):
+                return [TextContent(type="text", text=(
+                    "Read-only MCP: only SELECT, SHOW, DESCRIBE/DESC, EXPLAIN, "
+                    "and read-only CTE SELECT queries are allowed."
+                ))]
+
             return await run_query(query)
 
         elif name == "get_schema_info":
