@@ -7,7 +7,7 @@ import socket
 import time
 import subprocess
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from typing import List, Optional, Tuple, Any
 
 import anyio
@@ -554,7 +554,9 @@ async def main():
     Supports both STDIO (default) and SSE (HTTP) transport modes.
     """
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-    if transport == "sse":
+    if transport in ("streamable-http", "streamable_http", "http"):
+        await _run_streamable_http_server()
+    elif transport == "sse":
         await _run_sse_server()
     else:
         await _run_stdio_server()
@@ -573,6 +575,68 @@ async def _run_stdio_server():
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
             raise
+
+async def _run_streamable_http_server():
+    """Runs the server using MCP Streamable HTTP on /mcp."""
+    try:
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from mcp.server.transport_security import TransportSecuritySettings
+        from starlette.applications import Starlette
+        from starlette.routing import Mount, Route
+        from starlette.responses import Response
+        import uvicorn
+    except ImportError:
+        logger.error("Streamable HTTP transport requires a recent mcp 1.x SDK plus starlette and uvicorn")
+        raise
+
+    logger.info("Starting MySQL MCP server (Streamable HTTP)...")
+
+    host = os.getenv("MCP_HTTP_HOST") or os.getenv("MCP_SSE_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_HTTP_PORT") or os.getenv("PORT") or "8000")
+
+    allowed_hosts_env = (
+        os.getenv("MCP_HTTP_ALLOWED_HOSTS")
+        or os.getenv("MCP_SSE_ALLOWED_HOSTS", "")
+    )
+    if allowed_hosts_env:
+        allowed_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+    else:
+        allowed_hosts = [f"localhost:{port}", f"127.0.0.1:{port}"]
+
+    logger.info(
+        "Streamable HTTP DNS rebinding protection enabled. Allowed hosts: %s",
+        ", ".join(allowed_hosts),
+    )
+    security_settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+    )
+
+    session_manager = StreamableHTTPSessionManager(
+        app=app,
+        security_settings=security_settings,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_starlette_app):
+        async with session_manager.run():
+            yield
+
+    async def health_check(request):
+        return Response("MySQL MCP Server is running", media_type="text/plain")
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/", endpoint=health_check),
+            Mount("/mcp", app=session_manager.handle_request),
+        ],
+        lifespan=lifespan,
+    )
+
+    server_config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(server_config)
+    await server.serve()
+
 
 async def _run_sse_server():
     """
